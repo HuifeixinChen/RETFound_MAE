@@ -22,8 +22,14 @@ from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from huggingface_hub import hf_hub_download, login
 from engine_finetune import train_one_epoch, evaluate
 
+import timm
+from torchvision import models as tv_models
+
 import warnings
 import faulthandler
+
+import torch.nn.functional as F
+import pandas as pd
 
 faulthandler.enable()
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -127,6 +133,10 @@ def get_args_parser():
     parser.add_argument('--pin_mem', action='store_true',
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
     parser.set_defaults(pin_mem=True)
+    parser.add_argument('--save_pred', type=str, default='',
+                    help='Path to save per-image predictions CSV (e.g., predictions_test.csv). '
+                         'Leave empty to disable.')
+
 
     # distributed training parameters
     parser.add_argument('--world_size', default=1, type=int,
@@ -145,6 +155,75 @@ def get_args_parser():
 
     return parser
 
+def _extract_image_paths(dataset):
+    """
+    尽量通用地从 dataset 中拿到图像路径列表，顺序与 __getitem__(idx) 的 idx 对齐。
+    支持常见字段：.samples / .imgs / .images / .paths；若是 Subset，向下递归。
+    """
+    # torchvision ImageFolder / DatasetFolder
+    if hasattr(dataset, 'samples') and isinstance(dataset.samples, list):
+        return [p for (p, _) in dataset.samples]
+    if hasattr(dataset, 'imgs') and isinstance(dataset.imgs, list):
+        return [p for (p, _) in dataset.imgs]
+    # 自定义数据集常见写法
+    for name in ['paths', 'images', 'image_paths']:
+        if hasattr(dataset, name) and isinstance(getattr(dataset, name), list):
+            return list(getattr(dataset, name))
+    # 兼容 Subset
+    if hasattr(dataset, 'dataset'):
+        inner = _extract_image_paths(dataset.dataset)
+        if hasattr(dataset, 'indices'):
+            return [inner[i] for i in dataset.indices]
+        return inner
+    # 实在拿不到就返回 None
+    return None
+
+
+def _dump_predictions_csv(dataloader, model, device, out_csv_path, num_classes=2):
+    """
+    对 dataloader 顺序前向一次，保存：
+    image,pred_class,pred_confidence,probabilities
+    """
+    model.eval()
+    probs_all, preds_all, confs_all = [], [], []
+    # 注意：为了和路径对齐，需要 dataloader 的 sampler 为顺序（你的代码在非分布式评估时已是 SequentialSampler）
+    with torch.no_grad():
+        for (batch, *rest) in dataloader:
+            # 兼容 (images, target) 或 (images, target, path)
+            if isinstance(batch, torch.Tensor):
+                images = batch
+            else:
+                images = batch[0]
+            images = images.to(device, non_blocking=True)
+            logits = model(images)                         # [B, C]
+            probs  = F.softmax(logits, dim=1).cpu()        # [B, C]
+            conf, pred = torch.max(probs, dim=1)           # [B], [B]
+            probs_all.append(probs)
+            preds_all.append(pred)
+            confs_all.append(conf)
+
+    probs_all = torch.cat(probs_all, dim=0).numpy()
+    preds_all = torch.cat(preds_all, dim=0).numpy()
+    confs_all = torch.cat(confs_all, dim=0).numpy()
+
+    # 尝试从 dataset 提取路径（与顺序对齐）
+    ds = dataloader.dataset
+    img_paths = _extract_image_paths(ds)
+    if (img_paths is None) or (len(img_paths) != len(preds_all)):
+        # 回退：用 index 代替
+        img_paths = [f"index_{i}" for i in range(len(preds_all))]
+
+    rows = []
+    for pth, pc, cf, pv in zip(img_paths, preds_all, confs_all, probs_all):
+        rows.append({
+            "image": pth,
+            "pred_class": int(pc),
+            "pred_confidence": float(cf),
+            "probabilities": pv.tolist()
+        })
+    os.makedirs(os.path.dirname(out_csv_path) or ".", exist_ok=True)
+    pd.DataFrame(rows).to_csv(out_csv_path, index=False, encoding="utf-8")
+    print(f"[INFO] Saved predictions to: {out_csv_path}  (N={len(rows)})")
 
 def main(args, criterion):
     if args.resume and not args.eval:
@@ -175,12 +254,31 @@ def main(args, criterion):
         drop_path_rate=args.drop_path,
         global_pool=args.global_pool,
     )
+    elif args.model.lower() == 'resnet50':
+        # 使用 timm 预训练 ResNet50，并替换分类头
+        model = timm.create_model(
+            'resnet50',
+            pretrained=True,
+            num_classes=args.nb_classes
+    )
     else:
+        # 其它 ViT 系列
+        if args.model in models.__dict__:
+            model = models.__dict__[args.model](
+                num_classes=args.nb_classes,
+                drop_path_rate=args.drop_path,
+                args=args,
+            )
+        else:
+            raise ValueError(f"Unknown model: {args.model}")
+    
+
+        # 其它 ViT 系列
         model = models.__dict__[args.model](
             num_classes=args.nb_classes,
             drop_path_rate=args.drop_path,
             args=args,
-        )
+    )
     
     if args.finetune and not args.eval:
         
@@ -336,9 +434,25 @@ def main(args, criterion):
     if args.eval:
         if 'epoch' in checkpoint:
             print("Test with the best model at epoch = %d" % checkpoint['epoch'])
-        test_stats, auc_roc = evaluate(data_loader_test, model, device, args, epoch=0, mode='test',
-                                       num_class=args.nb_classes, log_writer=log_writer)
+        test_stats, auc_roc = evaluate(
+            data_loader_test, model, device, args, epoch=0, mode='test',
+            num_class=args.nb_classes, log_writer=log_writer
+        )
+        if args.save_pred:
+            # 建议默认写到 output_dir/task/ 下
+            out_csv = args.save_pred
+            if not os.path.isabs(out_csv) and args.output_dir:
+                task_dir = os.path.join(args.output_dir, args.task) if args.task else args.output_dir
+                out_csv = os.path.join(task_dir, out_csv)
+            _dump_predictions_csv(
+                dataloader=data_loader_test,
+                model=model,
+                device=device,
+                out_csv_path=out_csv,
+                num_classes=args.nb_classes
+            )
         exit(0)
+
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()

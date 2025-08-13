@@ -13,6 +13,7 @@ from sklearn.metrics import (
     hamming_loss, jaccard_score, recall_score, precision_score, cohen_kappa_score
 )
 from pycm import ConfusionMatrix
+from sklearn.metrics import confusion_matrix as sk_confusion_matrix
 import util.misc as misc
 import util.lr_sched as lr_sched
 
@@ -144,5 +145,22 @@ def evaluate(data_loader, model, device, args, epoch, mode, num_class, log_write
         cm = ConfusionMatrix(actual_vector=true_labels, predict_vector=pred_labels)
         cm.plot(cmap=plt.cm.Blues, number_label=True, normalized=True, plot_lib="matplotlib")
         plt.savefig(os.path.join(args.output_dir, args.task, 'confusion_matrix_test.jpg'), dpi=600, bbox_inches='tight')
-    
+    sk_cm = sk_confusion_matrix(true_labels, pred_labels)
+    print("Sklearn Confusion Matrix (raw counts):")
+    print(sk_cm)
+
+    # adjust these names to match your label encoding
+    class_names = ["papilledema", "pseudopapilledema", "normal"]
+    print("\n=== Sensitivity & Specificity per class ===")
+    for i, cls in enumerate(class_names):
+        TP = sk_cm[i, i]
+        FN = sk_cm[i, :].sum() - TP
+        FP = sk_cm[:, i].sum() - TP
+        TN = sk_cm.sum() - (TP + FN + FP)
+
+        sensitivity = TP / (TP + FN) if (TP + FN) > 0 else 0
+        specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
+
+        print(f"{cls}: Sensitivity = {sensitivity:.4f}, Specificity = {specificity:.4f}")
+
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, score
